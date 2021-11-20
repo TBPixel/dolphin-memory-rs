@@ -75,8 +75,8 @@ unsafe impl Send for Dolphin {}
 impl Clone for Dolphin {
     fn clone(&self) -> Self {
         Self {
-            handle: self.handle.clone(),
-            ram: self.ram.clone(),
+            handle: self.handle,
+            ram: self.ram,
         }
     }
 }
@@ -93,7 +93,7 @@ impl Dolphin {
 
         let handle = handle.set_arch(process_memory::Architecture::Arch32Bit);
 
-        return Ok(Dolphin { handle, ram });
+        Ok(Dolphin { handle, ram })
     }
 
     // read takes a starting address and an optional list of pointer offsets,
@@ -305,7 +305,7 @@ fn get_pid(process_names: Vec<&str>) -> process_memory::Pid {
         }
     }
 
-    return 0;
+    0
 }
 
 // ram_info is a convenient function wrapper for querying the emulated GC heap addresses.
@@ -322,9 +322,7 @@ fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
                 process.0,
                 p,
                 &mut info,
-                mem::size_of::<winnt::MEMORY_BASIC_INFORMATION>()
-                    .try_into()
-                    .unwrap(),
+                mem::size_of::<winnt::MEMORY_BASIC_INFORMATION>(),
             );
 
             if size != mem::size_of::<winnt::MEMORY_BASIC_INFORMATION>() {
@@ -332,13 +330,10 @@ fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
             }
 
             // check region size so that we know it's mem2
-            if info.RegionSize == MEM2_SIZE.try_into().unwrap() {
+            if info.RegionSize == MEM2_SIZE {
                 let region_base_address = info.BaseAddress as usize;
 
-                if mem1_found
-                    && region_base_address
-                        > (emu_ram_addresses.mem_1 + MEM1_START).try_into().unwrap()
-                {
+                if mem1_found && region_base_address > emu_ram_addresses.mem_1 + MEM1_START {
                     // in some cases MEM2 could actually be before MEM1. Once we find
                     // MEM1, ignore regions of this size that are too far away. There
                     // apparently are other non-MEM2 regions of size 0x40000000.
@@ -346,8 +341,10 @@ fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
                 }
 
                 // View the comment for MEM1
-                let mut ws_info = psapi::PSAPI_WORKING_SET_EX_INFORMATION::default();
-                ws_info.VirtualAddress = info.BaseAddress;
+                let mut ws_info = psapi::PSAPI_WORKING_SET_EX_INFORMATION {
+                    VirtualAddress: info.BaseAddress,
+                    ..Default::default()
+                };
                 if psapi::QueryWorkingSetEx(
                     process.0,
                     &mut ws_info as *mut _ as *mut ffi::c_void,
@@ -355,22 +352,21 @@ fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
                         .try_into()
                         .unwrap(),
                 ) != 0
+                    && ws_info.VirtualAttributes.Valid() == 1
                 {
-                    if ws_info.VirtualAttributes.Valid() == 1 {
-                        emu_ram_addresses.mem_2 = mem::transmute_copy(&info.BaseAddress);
-                        mem2_found = true;
-                    }
+                    emu_ram_addresses.mem_2 = mem::transmute_copy(&info.BaseAddress);
+                    mem2_found = true;
                 }
-            } else if !mem1_found
-                && info.RegionSize == MEM1_SIZE.try_into().unwrap()
-                && info.Type == winnt::MEM_MAPPED
+            } else if !mem1_found && info.RegionSize == MEM1_SIZE && info.Type == winnt::MEM_MAPPED
             {
                 // Here it's likely the right page, but it can happen that multiple pages
                 // with these criteria exists and have nothing to do with emulated memory.
                 // Only the right page has valid working set information so an additional
                 // check is required that it is backed by physical memory.
-                let mut ws_info_2 = psapi::PSAPI_WORKING_SET_EX_INFORMATION::default();
-                ws_info_2.VirtualAddress = info.BaseAddress;
+                let mut ws_info_2 = psapi::PSAPI_WORKING_SET_EX_INFORMATION {
+                    VirtualAddress: info.BaseAddress,
+                    ..Default::default()
+                };
                 if psapi::QueryWorkingSetEx(
                     process.0,
                     &mut ws_info_2 as *mut _ as *mut ffi::c_void,
@@ -378,11 +374,10 @@ fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
                         .try_into()
                         .unwrap(),
                 ) != 0
+                    && ws_info_2.VirtualAttributes.Valid() == 1
                 {
-                    if ws_info_2.VirtualAttributes.Valid() == 1 {
-                        emu_ram_addresses.mem_1 = mem::transmute_copy(&info.BaseAddress);
-                        mem1_found = true;
-                    }
+                    emu_ram_addresses.mem_1 = mem::transmute_copy(&info.BaseAddress);
+                    mem1_found = true;
                 }
             }
 
@@ -399,5 +394,5 @@ fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
         return Err(ProcessError::EmulationNotRunning);
     }
 
-    return Ok(emu_ram_addresses);
+    Ok(emu_ram_addresses)
 }
