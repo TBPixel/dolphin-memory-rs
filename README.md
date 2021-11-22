@@ -1,6 +1,6 @@
 # dolphin-memory-rs
 
-A crate for reading from and writing to the emulated memory of Dolphin in rust.
+A crate for reading from and writing to the emulated memory of Dolphin in rust. A lot of internals here are directly based on [aldelaro5's Dolphin Memory Engine](https://github.com/aldelaro5/Dolphin-memory-engine).
 
 Currently the only platform supported is Windows, though it should be possible to port it to other platforms.
 
