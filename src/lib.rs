@@ -36,31 +36,19 @@ pub enum ProcessError {
     UnknownError,
 }
 
-#[derive(Error, Debug)]
-pub enum MemoryError {
-    #[error(
-        "failed to read memory at address `{address:#x}`, error code `{error_code:?}: {message:?}`"
-    )]
-    ReadError {
-        address: usize,
-        error_code: u32,
-        message: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Process {
     pid: u32,
     handle: winnt::HANDLE,
 }
 
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct EmuRAMAddresses {
     mem_1: usize,
     mem_2: usize,
 }
 
-#[derive(Debug, Copy)]
+#[derive(Debug, Clone)]
 pub struct Dolphin {
     handle: ProcessHandle,
     ram: EmuRAMAddresses,
@@ -72,33 +60,26 @@ pub struct Dolphin {
 // issues as we're never changing anything about this pointer.
 unsafe impl Send for Dolphin {}
 
-impl Clone for Dolphin {
-    fn clone(&self) -> Self {
-        Self {
-            handle: self.handle,
-            ram: self.ram,
-        }
-    }
-}
-
 impl Dolphin {
     // new hooks into the Dolphin process and into the gamecube ram. This can block while looking,
     // but more likely it will error on failure. An easy pattern to check this on repeat is to loop and break
     // on success. You can opt-to do something with the error if you choose, but during hook it's really only basic insights.
     pub fn new() -> Result<Self, ProcessError> {
-        let handle = get_pid(vec!["Dolphin.exe", "DolphinQt1.exe", "DolphinWx.exe"])
-            .try_into_process_handle()
-            .map_err(|_| ProcessError::UnknownError)?;
-        let ram = ram_info(handle)?;
+        let handle = match get_pid(vec!["Dolphin.exe", "DolphinQt1.exe", "DolphinWx.exe"]) {
+            Some(h) => h
+                .try_into_process_handle()
+                .map_err(|_| ProcessError::UnknownError)?,
+            None => return Err(ProcessError::DolphinNotFound),
+        };
 
+        let ram = ram_info(handle)?;
         let handle = handle.set_arch(process_memory::Architecture::Arch32Bit);
 
         Ok(Dolphin { handle, ram })
     }
 
-    // read takes a starting address and an optional list of pointer offsets,
+    // read takes a size, starting address and an optional list of pointer offsets,
     // following those addresses until it hits the underyling data.
-    // read then reads a buffer of size <T> and returns it.
     //
     // TODO: There's a number of issues with this function. For starters,
     // it only knows how to handle MEM1 addresses. Supporting addresses
@@ -108,15 +89,15 @@ impl Dolphin {
     // every single time it's run, but in all likelihood the addresses will not
     // change that frequently. It would be a good idea to introduce a cache layer here
     // which caches the output address using a hash of the input address + offsets.
-    pub fn read<T>(
+    pub fn read(
         &self,
+        size: usize,
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<Vec<u8>> {
         // TODO: this should realistically be able to handle picking mem_1 or mem_2,
         // but we'll just stick to mem_1 for now.
         let starting_address = starting_address & MEM1_STRIP_START;
-        let size = std::mem::size_of::<T>();
         let mut buffer = vec![0_u8; size];
 
         if pointer_offsets.is_none() {
@@ -136,12 +117,20 @@ impl Dolphin {
             let mut ptr_buffer = vec![0_u8; std::mem::size_of::<u32>()];
             self.handle
                 .copy_address(self.ram.mem_1 + starting_address, &mut ptr_buffer)?;
+
             let mut current_ptr: usize = io::Cursor::new(ptr_buffer)
                 .read_u32::<BigEndian>()?
                 .try_into()
                 .map_err(|e: TryFromIntError| {
                     io::Error::new(io::ErrorKind::Other, e.to_string())
                 })?;
+
+            if current_ptr == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "null pointer address",
+                ));
+            }
 
             for (index, offset) in offsets.iter().enumerate() {
                 // We'll need a new ptr_buffer for each pointer
@@ -170,6 +159,13 @@ impl Dolphin {
                     .map_err(|e: TryFromIntError| {
                         io::Error::new(io::ErrorKind::Other, e.to_string())
                     })?;
+
+                if current_ptr == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "null pointer address",
+                    ));
+                }
             }
         }
 
@@ -182,7 +178,7 @@ impl Dolphin {
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<u8> {
-        let buf = self.read::<u8>(starting_address, pointer_offsets)?;
+        let buf = self.read(mem::size_of::<u8>(), starting_address, pointer_offsets)?;
         let n = std::io::Cursor::new(buf).read_u8()?;
 
         Ok(n)
@@ -194,7 +190,7 @@ impl Dolphin {
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<u16> {
-        let buf = self.read::<u16>(starting_address, pointer_offsets)?;
+        let buf = self.read(mem::size_of::<u16>(), starting_address, pointer_offsets)?;
         let n = std::io::Cursor::new(buf).read_u16::<BigEndian>()?;
 
         Ok(n)
@@ -206,7 +202,7 @@ impl Dolphin {
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<u32> {
-        let buf = self.read::<u32>(starting_address, pointer_offsets)?;
+        let buf = self.read(mem::size_of::<u32>(), starting_address, pointer_offsets)?;
         let n = std::io::Cursor::new(buf).read_u32::<BigEndian>()?;
 
         Ok(n)
@@ -218,7 +214,7 @@ impl Dolphin {
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<i8> {
-        let buf = self.read::<i8>(starting_address, pointer_offsets)?;
+        let buf = self.read(mem::size_of::<i8>(), starting_address, pointer_offsets)?;
         let n = std::io::Cursor::new(buf).read_i8()?;
 
         Ok(n)
@@ -230,7 +226,7 @@ impl Dolphin {
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<i16> {
-        let buf = self.read::<i16>(starting_address, pointer_offsets)?;
+        let buf = self.read(mem::size_of::<i16>(), starting_address, pointer_offsets)?;
         let n = std::io::Cursor::new(buf).read_i16::<BigEndian>()?;
 
         Ok(n)
@@ -242,7 +238,7 @@ impl Dolphin {
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<i32> {
-        let buf = self.read::<i32>(starting_address, pointer_offsets)?;
+        let buf = self.read(mem::size_of::<i32>(), starting_address, pointer_offsets)?;
         let n = std::io::Cursor::new(buf).read_i32::<BigEndian>()?;
 
         Ok(n)
@@ -254,15 +250,30 @@ impl Dolphin {
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<f32> {
-        let buf = self.read::<f32>(starting_address, pointer_offsets)?;
+        let buf = self.read(mem::size_of::<f32>(), starting_address, pointer_offsets)?;
         let f = std::io::Cursor::new(buf).read_f32::<BigEndian>()?;
 
         Ok(f)
     }
+
+    // read_string provides a convenient read and cast to a String.
+    // Note that strings are expected to be utf8 and the length will account
+    // for the number of bytes to read.
+    pub fn read_string(
+        &self,
+        length: usize,
+        starting_address: usize,
+        pointer_offsets: Option<&[usize]>,
+    ) -> io::Result<String> {
+        let buf = self.read(length, starting_address, pointer_offsets)?;
+        let string = String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        Ok(string)
+    }
 }
 
 // get_pid looks up the process id for the given list of process names
-fn get_pid(process_names: Vec<&str>) -> process_memory::Pid {
+fn get_pid(process_names: Vec<&str>) -> Option<process_memory::Pid> {
     fn utf8_to_string(bytes: &[i8]) -> String {
         use std::ffi::CStr;
         unsafe {
@@ -299,13 +310,13 @@ fn get_pid(process_names: Vec<&str>) -> process_memory::Pid {
                 == winapi::shared::minwindef::TRUE
             {
                 if process_names.contains(&utf8_to_string(&entry.szExeFile).as_str()) {
-                    return entry.th32ProcessID;
+                    return Some(entry.th32ProcessID);
                 }
             }
         }
     }
 
-    0
+    None
 }
 
 // ram_info is a convenient function wrapper for querying the emulated GC heap addresses.
@@ -313,8 +324,10 @@ fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
     let mut info = winnt::MEMORY_BASIC_INFORMATION::default();
     let mut mem1_found = false;
     let mut mem2_found = false;
-    let mut emu_ram_addresses = EmuRAMAddresses::default();
+    let mut emu_ram_addresses = EmuRAMAddresses { mem_1: 0, mem_2: 0 };
 
+    // TODO: this unsafe block is huge and complicated. It would be ideal to reign
+    // this in a little to only cover the exact unsafe things that we need to cover.
     unsafe {
         let mut p = ptr::null_mut();
         loop {
