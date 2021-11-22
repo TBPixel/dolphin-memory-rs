@@ -1,9 +1,12 @@
 [package]
 name = "dolphin-memory"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors = ["Madison Barry <madison.barry@hey.com>"]
+readme = "README.md"
+license = "MIT"
+description = "A rust library that makes reading and writing memory of the Dolphin emulator easier."
+repository = "https://github.com/TBPixel/dolphin-memory-rs"
 
 [dependencies]
 thiserror = "1.0.30"
