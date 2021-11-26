@@ -8,14 +8,16 @@ use std::io;
 use std::mem;
 use std::num::TryFromIntError;
 use std::ptr;
-use thiserror::Error;
 
 use winapi::um::memoryapi;
 use winapi::um::psapi;
 use winapi::um::winnt;
 
 use byteorder::{BigEndian, ReadBytesExt};
-use process_memory::{CopyAddress, ProcessHandle, ProcessHandleExt, TryIntoProcessHandle};
+use process_memory::{
+    CopyAddress, ProcessHandle, ProcessHandleExt, PutAddress, TryIntoProcessHandle,
+};
+use thiserror::Error;
 
 // MEM1_STRIP_START is  useful for stripping the `8` from the start
 // of memory addresses within the MEM1 region.
@@ -100,76 +102,64 @@ impl Dolphin {
         let starting_address = starting_address & MEM1_STRIP_START;
         let mut buffer = vec![0_u8; size];
 
-        if pointer_offsets.is_none() {
-            let address = self
-                .handle
-                .get_offset(&[self.ram.mem_1 + starting_address])?;
-
-            self.handle.copy_address(address, &mut buffer)?;
+        if let Some(offsets) = pointer_offsets {
+            let addr = self.resolve_pointer_address(starting_address, offsets)?;
+            self.handle.copy_address(addr, &mut buffer)?;
 
             return Ok(buffer);
         }
 
-        if let Some(offsets) = pointer_offsets {
-            // read the starting address to get the initial pointer.
-            // we could have multiple pointer chains to follow, but we know the starting
-            // address is where we want to look first to kick ourselves off on the right foot.
-            let mut ptr_buffer = vec![0_u8; std::mem::size_of::<u32>()];
-            self.handle
-                .copy_address(self.ram.mem_1 + starting_address, &mut ptr_buffer)?;
+        let address = self
+            .handle
+            .get_offset(&[self.ram.mem_1 + starting_address])?;
 
-            let mut current_ptr: usize = io::Cursor::new(ptr_buffer)
-                .read_u32::<BigEndian>()?
-                .try_into()
-                .map_err(|e: TryFromIntError| {
-                    io::Error::new(io::ErrorKind::Other, e.to_string())
-                })?;
-
-            if current_ptr == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "null pointer address",
-                ));
-            }
-
-            for (index, offset) in offsets.iter().enumerate() {
-                // We'll need a new ptr_buffer for each pointer
-                let mut ptr_buffer = vec![0_u8; std::mem::size_of::<u32>()];
-
-                // Copy and update the current address for each iteration,
-                // as this will be our starting point on subsequent loops.
-                // This also conveniently handles dropping the `8` a the start
-                // of all MEM1 addresses.
-                // TODO: Update this to better handle MEM2.
-                let addr = (current_ptr & MEM1_STRIP_START) + offset;
-
-                // the last iteration we've likely reached the value we're looking
-                // for, so lets just copy that and break out.
-                if index == offsets.len() - 1 {
-                    self.handle
-                        .copy_address(self.ram.mem_1 + addr, &mut buffer)?;
-                    break;
-                }
-
-                self.handle
-                    .copy_address(self.ram.mem_1 + addr, &mut ptr_buffer)?;
-                current_ptr = io::Cursor::new(ptr_buffer)
-                    .read_u32::<BigEndian>()?
-                    .try_into()
-                    .map_err(|e: TryFromIntError| {
-                        io::Error::new(io::ErrorKind::Other, e.to_string())
-                    })?;
-
-                if current_ptr == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "null pointer address",
-                    ));
-                }
-            }
-        }
+        self.handle.copy_address(address, &mut buffer)?;
 
         Ok(buffer)
+    }
+
+    // write a buffer of bytes to the given address or pointer of address.
+    pub fn write(
+        &self,
+        buf: &[u8],
+        starting_address: usize,
+        pointer_offsets: Option<&[usize]>,
+    ) -> io::Result<()> {
+        if let Some(offsets) = pointer_offsets {
+            let addr = self.resolve_pointer_address(starting_address, offsets)?;
+            self.handle.put_address(addr, buf)?;
+
+            return Ok(());
+        }
+
+        let starting_address = self.ram.mem_1 + (starting_address & MEM1_STRIP_START);
+        self.handle.put_address(starting_address, buf)?;
+
+        Ok(())
+    }
+
+    // write_u8 wraps write and provides a simple interface for writing a u8 to dolphin memory
+    pub fn write_u8(
+        &self,
+        n: u8,
+        starting_address: usize,
+        pointer_offsets: Option<&[usize]>,
+    ) -> io::Result<()> {
+        self.write(&[n], starting_address, pointer_offsets)?;
+
+        Ok(())
+    }
+
+    // write_f32 wraps write and provides a simple interface for writing an f32 to dolphin memory
+    pub fn write_f32(
+        &self,
+        f: f32,
+        starting_address: usize,
+        pointer_offsets: Option<&[usize]>,
+    ) -> io::Result<()> {
+        self.write(&f.to_be_bytes(), starting_address, pointer_offsets)?;
+
+        Ok(())
     }
 
     // read_u8 wraps read to provide a convenient cast to an u8.
@@ -269,6 +259,92 @@ impl Dolphin {
         let string = String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         Ok(string)
+    }
+
+    // resolve_pointer_address follows a series of pointer offsets until
+    // it reachines the last pointer, in which case that address is returned.
+    //
+    // note that it is returned as a fully-qualified address, meaning no memory
+    // offsets are needed.
+    fn resolve_pointer_address(
+        &self,
+        starting_address: usize,
+        offsets: &[usize],
+    ) -> io::Result<usize> {
+        // TODO: this should realistically be able to handle picking mem_1 or mem_2,
+        // but we'll just stick to mem_1 for now.
+        let starting_address = starting_address & MEM1_STRIP_START;
+
+        // read the starting address to get the initial pointer.
+        // we could have multiple pointer chains to follow, but we know the starting
+        // address is where we want to look first to kick ourselves off on the right foot.
+        let mut ptr_buffer = vec![0_u8; std::mem::size_of::<u32>()];
+        self.handle
+            .copy_address(self.ram.mem_1 + starting_address, &mut ptr_buffer)?;
+
+        let mut current_ptr: usize = io::Cursor::new(ptr_buffer)
+            .read_u32::<BigEndian>()?
+            .try_into()
+            .map_err(|e: TryFromIntError| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        if current_ptr == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "null pointer address",
+            ));
+        }
+
+        let mut ptr_addr: usize = 0;
+        for (index, offset) in offsets.iter().enumerate() {
+            // We'll need a new ptr_buffer for each pointer
+            let mut ptr_buffer = vec![0_u8; std::mem::size_of::<u32>()];
+
+            // Copy and update the current address for each iteration,
+            // as this will be our starting point on subsequent loops.
+            // This also conveniently handles dropping the `8` a the start
+            // of all MEM1 addresses.
+            // TODO: Update this to better handle MEM2.
+            let addr = (current_ptr & MEM1_STRIP_START) + offset;
+
+            // the last iteration we've likely reached the value we're looking
+            // for, so lets just copy that and break out.
+            if index == offsets.len() - 1 {
+                if current_ptr == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "null pointer address",
+                    ));
+                }
+
+                ptr_addr = self.ram.mem_1 + addr;
+                break;
+            }
+
+            self.handle
+                .copy_address(self.ram.mem_1 + addr, &mut ptr_buffer)?;
+            current_ptr = io::Cursor::new(ptr_buffer)
+                .read_u32::<BigEndian>()?
+                .try_into()
+                .map_err(|e: TryFromIntError| {
+                    io::Error::new(io::ErrorKind::Other, e.to_string())
+                })?;
+
+            if current_ptr == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "null pointer address",
+                ));
+            }
+        }
+
+        if ptr_addr == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "null pointer address",
+            ));
+        }
+
+        Ok(ptr_addr)
     }
 }
 
