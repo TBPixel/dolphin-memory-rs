@@ -9,15 +9,14 @@ use std::mem;
 use std::num::TryFromIntError;
 use std::ptr;
 
-use winapi::um::memoryapi;
-use winapi::um::psapi;
-use winapi::um::winnt;
-
 use byteorder::{BigEndian, ReadBytesExt};
 use process_memory::{
     CopyAddress, ProcessHandle, ProcessHandleExt, PutAddress, TryIntoProcessHandle,
 };
 use thiserror::Error;
+use winapi::um::memoryapi;
+use winapi::um::psapi;
+use winapi::um::winnt;
 
 // MEM1_STRIP_START is  useful for stripping the `8` from the start
 // of memory addresses within the MEM1 region.
@@ -28,14 +27,33 @@ pub const MEM1_END: usize = 0x81800000;
 pub const MEM1_SIZE: usize = 0x2000000;
 pub const MEM2_SIZE: usize = 0x4000000;
 
-#[derive(Error, Debug)]
+fn error_chain_fmt(
+    e: &impl std::error::Error,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    writeln!(f, "{}\n", e)?;
+    let mut current = e.source();
+    while let Some(cause) = current {
+        writeln!(f, "Caused by:\n\t{}", cause)?;
+        current = cause.source();
+    }
+    Ok(())
+}
+
+#[derive(Error)]
 pub enum ProcessError {
     #[error("failed to find process for dolphin")]
     DolphinNotFound,
     #[error("emulation not running")]
     EmulationNotRunning,
     #[error("unknown error")]
-    UnknownError,
+    UnknownError(#[source] io::Error),
+}
+
+impl std::fmt::Debug for ProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        error_chain_fmt(self, f)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +88,7 @@ impl Dolphin {
         let handle = match get_pid(vec!["Dolphin.exe", "DolphinQt1.exe", "DolphinWx.exe"]) {
             Some(h) => h
                 .try_into_process_handle()
-                .map_err(|_| ProcessError::UnknownError)?,
+                .map_err(|e| ProcessError::UnknownError(e))?,
             None => return Err(ProcessError::DolphinNotFound),
         };
 
@@ -78,6 +96,14 @@ impl Dolphin {
         let handle = handle.set_arch(process_memory::Architecture::Arch32Bit);
 
         Ok(Dolphin { handle, ram })
+    }
+
+    // is_emulation_running queries ram info to determine if the emulator is still running.
+    pub fn is_emulation_running(&self) -> bool {
+        match ram_info(self.handle) {
+            Ok(_) => true,
+            Err(_) => false,
+        }
     }
 
     // read takes a size, starting address and an optional list of pointer offsets,
@@ -145,9 +171,57 @@ impl Dolphin {
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<()> {
-        self.write(&[n], starting_address, pointer_offsets)?;
+        self.write(&[n], starting_address, pointer_offsets)
+    }
 
-        Ok(())
+    // write_u16 wraps write and provides a simple interface for writing a u16 to dolphin memory
+    pub fn write_u16(
+        &self,
+        n: u16,
+        starting_address: usize,
+        pointer_offsets: Option<&[usize]>,
+    ) -> io::Result<()> {
+        self.write(&n.to_be_bytes(), starting_address, pointer_offsets)
+    }
+
+    // write_u32 wraps write and provides a simple interface for writing a u32 to dolphin memory
+    pub fn write_u32(
+        &self,
+        n: u32,
+        starting_address: usize,
+        pointer_offsets: Option<&[usize]>,
+    ) -> io::Result<()> {
+        self.write(&n.to_be_bytes(), starting_address, pointer_offsets)
+    }
+
+    // write_i8 wraps write and provides a simple interface for writing a i8 to dolphin memory
+    pub fn write_i8(
+        &self,
+        n: i8,
+        starting_address: usize,
+        pointer_offsets: Option<&[usize]>,
+    ) -> io::Result<()> {
+        self.write(&n.to_be_bytes(), starting_address, pointer_offsets)
+    }
+
+    // write_i16 wraps write and provides a simple interface for writing a i16 to dolphin memory
+    pub fn write_i16(
+        &self,
+        n: i16,
+        starting_address: usize,
+        pointer_offsets: Option<&[usize]>,
+    ) -> io::Result<()> {
+        self.write(&n.to_be_bytes(), starting_address, pointer_offsets)
+    }
+
+    // write_i32 wraps write and provides a simple interface for writing a i32 to dolphin memory
+    pub fn write_i32(
+        &self,
+        n: i32,
+        starting_address: usize,
+        pointer_offsets: Option<&[usize]>,
+    ) -> io::Result<()> {
+        self.write(&n.to_be_bytes(), starting_address, pointer_offsets)
     }
 
     // write_f32 wraps write and provides a simple interface for writing an f32 to dolphin memory
@@ -157,9 +231,7 @@ impl Dolphin {
         starting_address: usize,
         pointer_offsets: Option<&[usize]>,
     ) -> io::Result<()> {
-        self.write(&f.to_be_bytes(), starting_address, pointer_offsets)?;
-
-        Ok(())
+        self.write(&f.to_be_bytes(), starting_address, pointer_offsets)
     }
 
     // read_u8 wraps read to provide a convenient cast to an u8.
@@ -373,21 +445,18 @@ fn get_pid(process_names: Vec<&str>) -> Option<process_memory::Pid> {
     };
 
     let snapshot: winapi::um::winnt::HANDLE;
-    unsafe {
-        snapshot = winapi::um::tlhelp32::CreateToolhelp32Snapshot(
-            winapi::um::tlhelp32::TH32CS_SNAPPROCESS,
-            0,
-        );
+    snapshot = unsafe {
+        winapi::um::tlhelp32::CreateToolhelp32Snapshot(winapi::um::tlhelp32::TH32CS_SNAPPROCESS, 0)
+    };
 
-        if winapi::um::tlhelp32::Process32First(snapshot, &mut entry)
+    if unsafe { winapi::um::tlhelp32::Process32First(snapshot, &mut entry) }
+        == winapi::shared::minwindef::TRUE
+    {
+        while unsafe { winapi::um::tlhelp32::Process32Next(snapshot, &mut entry) }
             == winapi::shared::minwindef::TRUE
         {
-            while winapi::um::tlhelp32::Process32Next(snapshot, &mut entry)
-                == winapi::shared::minwindef::TRUE
-            {
-                if process_names.contains(&utf8_to_string(&entry.szExeFile).as_str()) {
-                    return Some(entry.th32ProcessID);
-                }
+            if process_names.contains(&utf8_to_string(&entry.szExeFile).as_str()) {
+                return Some(entry.th32ProcessID);
             }
         }
     }
@@ -397,91 +466,112 @@ fn get_pid(process_names: Vec<&str>) -> Option<process_memory::Pid> {
 
 // ram_info is a convenient function wrapper for querying the emulated GC heap addresses.
 fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
-    let mut info = winnt::MEMORY_BASIC_INFORMATION::default();
-    let mut mem1_found = false;
-    let mut mem2_found = false;
-    let mut emu_ram_addresses = EmuRAMAddresses { mem_1: 0, mem_2: 0 };
+    let mut mem1: Option<usize> = None;
+    let mut mem2: Option<usize> = None;
 
-    // TODO: this unsafe block is huge and complicated. It would be ideal to reign
-    // this in a little to only cover the exact unsafe things that we need to cover.
-    unsafe {
-        let mut p = ptr::null_mut();
-        loop {
-            let size = memoryapi::VirtualQueryEx(
+    let mut p = ptr::null_mut();
+    let mut info = winnt::MEMORY_BASIC_INFORMATION::default();
+    loop {
+        // Attempt to retrieve a range of pages within the virtual address space
+        let size = unsafe {
+            memoryapi::VirtualQueryEx(
                 process.0,
                 p,
                 &mut info,
                 mem::size_of::<winnt::MEMORY_BASIC_INFORMATION>(),
-            );
+            )
+        };
+        if size != mem::size_of::<winnt::MEMORY_BASIC_INFORMATION>() {
+            break;
+        }
 
-            if size != mem::size_of::<winnt::MEMORY_BASIC_INFORMATION>() {
-                break;
-            }
+        // check region size so that we know it's mem2
+        if info.RegionSize == MEM2_SIZE {
+            let region_base_address = info.BaseAddress as usize;
 
-            // check region size so that we know it's mem2
-            if info.RegionSize == MEM2_SIZE {
-                let region_base_address = info.BaseAddress as usize;
-
-                if mem1_found && region_base_address > emu_ram_addresses.mem_1 + MEM1_START {
+            if let Some(region) = mem1 {
+                if region_base_address > region + MEM1_START {
                     // in some cases MEM2 could actually be before MEM1. Once we find
                     // MEM1, ignore regions of this size that are too far away. There
                     // apparently are other non-MEM2 regions of size 0x40000000.
                     break;
                 }
+            }
 
-                // View the comment for MEM1
-                let mut ws_info = psapi::PSAPI_WORKING_SET_EX_INFORMATION {
-                    VirtualAddress: info.BaseAddress,
-                    ..Default::default()
-                };
-                if psapi::QueryWorkingSetEx(
+            // View the comment for MEM1
+            let mut ws_info = psapi::PSAPI_WORKING_SET_EX_INFORMATION {
+                VirtualAddress: info.BaseAddress,
+                ..Default::default()
+            };
+            let page_info = unsafe {
+                match psapi::QueryWorkingSetEx(
                     process.0,
                     &mut ws_info as *mut _ as *mut ffi::c_void,
                     mem::size_of::<psapi::PSAPI_WORKING_SET_EX_INFORMATION>()
                         .try_into()
                         .unwrap(),
-                ) != 0
-                    && ws_info.VirtualAttributes.Valid() == 1
-                {
-                    emu_ram_addresses.mem_2 = mem::transmute_copy(&info.BaseAddress);
-                    mem2_found = true;
+                ) {
+                    0 => Err(io::Error::last_os_error()),
+                    _ => Ok(()),
                 }
-            } else if !mem1_found && info.RegionSize == MEM1_SIZE && info.Type == winnt::MEM_MAPPED
-            {
-                // Here it's likely the right page, but it can happen that multiple pages
-                // with these criteria exists and have nothing to do with emulated memory.
-                // Only the right page has valid working set information so an additional
-                // check is required that it is backed by physical memory.
-                let mut ws_info_2 = psapi::PSAPI_WORKING_SET_EX_INFORMATION {
-                    VirtualAddress: info.BaseAddress,
-                    ..Default::default()
-                };
-                if psapi::QueryWorkingSetEx(
+            };
+            if page_info.is_ok() && ws_info.VirtualAttributes.Valid() == 1 {
+                // note that mem::transmute_copy triggers undefined behavior
+                // if the output type is larger than the pointer.
+                //
+                // A good safety precaution here would be to check this before
+                // calling mem::transmute_copy, just to be safe.
+                unsafe {
+                    mem2 = Some(mem::transmute_copy(&info.BaseAddress));
+                }
+            }
+        } else if mem1.is_none() && info.RegionSize == MEM1_SIZE && info.Type == winnt::MEM_MAPPED {
+            // Here it's likely the right page, but it can happen that multiple pages
+            // with these criteria exists and have nothing to do with emulated memory.
+            // Only the right page has valid working set information so an additional
+            // check is required that it is backed by physical memory.
+            let mut ws_info = psapi::PSAPI_WORKING_SET_EX_INFORMATION {
+                VirtualAddress: info.BaseAddress,
+                ..Default::default()
+            };
+            let page_info = unsafe {
+                match psapi::QueryWorkingSetEx(
                     process.0,
-                    &mut ws_info_2 as *mut _ as *mut ffi::c_void,
+                    &mut ws_info as *mut _ as *mut ffi::c_void,
                     mem::size_of::<psapi::PSAPI_WORKING_SET_EX_INFORMATION>()
                         .try_into()
                         .unwrap(),
-                ) != 0
-                    && ws_info_2.VirtualAttributes.Valid() == 1
-                {
-                    emu_ram_addresses.mem_1 = mem::transmute_copy(&info.BaseAddress);
-                    mem1_found = true;
+                ) {
+                    0 => Err(io::Error::last_os_error()),
+                    _ => Ok(()),
+                }
+            };
+            if page_info.is_ok() && ws_info.VirtualAttributes.Valid() == 1 {
+                // note that mem::transmute_copy triggers undefined behavior
+                // if the output type is larger than the pointer.
+                //
+                // A good safety precaution here would be to check this before
+                // calling mem::transmute_copy, just to be safe.
+                unsafe {
+                    mem1 = Some(mem::transmute_copy(&info.BaseAddress));
                 }
             }
-
-            if mem1_found && mem2_found {
-                break;
-            }
-
-            // iter through region size
-            p = p.add(info.RegionSize);
         }
+
+        if mem1.is_some() && mem2.is_some() {
+            break;
+        }
+
+        // iter through region size
+        unsafe { p = p.add(info.RegionSize) };
     }
 
-    if emu_ram_addresses.mem_1 == 0 {
+    if mem1.is_none() {
         return Err(ProcessError::EmulationNotRunning);
     }
 
-    Ok(emu_ram_addresses)
+    Ok(EmuRAMAddresses {
+        mem_1: mem1.unwrap_or_default(),
+        mem_2: mem2.unwrap_or_default(),
+    })
 }
