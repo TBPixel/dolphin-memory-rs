@@ -503,14 +503,14 @@ fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
                 VirtualAddress: info.BaseAddress,
                 ..Default::default()
             };
-            let page_info = unsafe {
-                match psapi::QueryWorkingSetEx(
+            let page_info = {
+                match unsafe { psapi::QueryWorkingSetEx(
                     process.0,
                     &mut ws_info as *mut _ as *mut ffi::c_void,
                     mem::size_of::<psapi::PSAPI_WORKING_SET_EX_INFORMATION>()
                         .try_into()
                         .unwrap(),
-                ) {
+                ) }{
                     0 => Err(io::Error::last_os_error()),
                     _ => Ok(()),
                 }
@@ -534,14 +534,14 @@ fn ram_info(process: ProcessHandle) -> Result<EmuRAMAddresses, ProcessError> {
                 VirtualAddress: info.BaseAddress,
                 ..Default::default()
             };
-            let page_info = unsafe {
-                match psapi::QueryWorkingSetEx(
+            let page_info = {
+                match unsafe { psapi::QueryWorkingSetEx(
                     process.0,
                     &mut ws_info as *mut _ as *mut ffi::c_void,
                     mem::size_of::<psapi::PSAPI_WORKING_SET_EX_INFORMATION>()
                         .try_into()
                         .unwrap(),
-                ) {
+                ) }{
                     0 => Err(io::Error::last_os_error()),
                     _ => Ok(()),
                 }
